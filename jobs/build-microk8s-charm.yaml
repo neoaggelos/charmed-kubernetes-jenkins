@@ -187,13 +187,120 @@
 
           sudo lxc shell $container -- bash -c "charmcraft release $CHARM_NAME --revision $revision --channel $CHANNEL"
 
-          # TODO: update when charmcraft supports non-interactive logins
-          # juju scp $CHARMCRAFT_CREDENTIALS ubuntu/leader:snap/charmcraft/common/config/charmcraft.credentials
-          run 'charmcraft login'
+- job:
+    name: 'test-microk8s-charm'
+    description: |
+      Test a MicroK8s charm
+    project-type: freestyle
+    node: runner-amd64
+    wrappers:
+      - ansicolor
+      - timestamps
+      - workspace-cleanup
+      - credentials-binding:
+          - file:
+              credential-id: JUJUCONTROLLERS_SERVERSTACK
+              variable: JUJUCONTROLLERS_SERVERSTACK
+          - file:
+              credential-id: JUJUACCOUNTS_SERVERSTACK
+              variable: JUJUACCOUNTS_SERVERSTACK
+    parameters:
+      - string:
+          name: REPOSITORY
+          default: "https://github.com/canonical/charm-microk8s.git"
+          description: |
+            Source repository for MicroK8s charm tests.
+      - string:
+          name: BRANCH
+          default: "master"
+          description: |
+            Branch from which to run the MicroK8s charm tests.
+      - string:
+          name: CHARM_NAME
+          default: "microk8s"
+          description: |
+            MicroK8s charm name to install.
+      - string:
+          name: CHARM_CHANNEL
+          default: "edge"
+          description: |
+            Charm channel.
+      - string:
+          name: CLUSTER_SIZE
+          default: "3"
+          description: |
+            Cluster size for integration tests.
+      - string:
+          name: SNAP_CHANNELS
+          default: "1.20 1.21 1.22"
+          description: |
+            MicroK8s snap channels to test (space or comma separated).
+      - bool:
+          name: PARALLEL
+          default: "false"
+          description: |
+            Run tests in parallel.
+    properties:
+      - build-discarder:
+          num-to-keep: 3
+      - build-blocker:
+          use-build-blocker: true
+          blocking-jobs:
+            - "infra.*"
+          block-level: 'NODE'
 
-          run 'charmcraft whoami'
-          run "git clone ${REPOSITORY} -b ${BRANCH} charm"
-          run 'cd charm && charmcraft build -v'
-          run 'cd charm && charmcraft upload *.charm'
+    builders:
+      - shell: |
+          #!/bin/bash
+          set -eux
+          set -o allexport
+          [[ -f $WORKSPACE/.env ]] && source $WORKSPACE/.env
+          set +o allexport
 
-          juju scp 'ubuntu/leader:charm/*.charm' ./
+          function cleanup() {
+            set +e
+            juju destroy-model $JUJU_MODEL -y --timeout 1m --force
+            rm -rf $JUJU_DATA
+            rm -rf $REPO_DIR
+            set -e
+          }
+          trap cleanup EXIT
+
+          export REPO_DIR=microk8s-${BUILD_NUMBER}
+          export JUJU_DATA=$PWD/data
+          export JUJU_MODEL=test-microk8s-charm-${BUILD_NUMBER}
+          mkdir -p $JUJU_DATA
+          cp $JUJUACCOUNTS_SERVERSTACK $JUJU_DATA/accounts.yaml
+          cp $JUJUCONTROLLERS_SERVERSTACK $JUJU_DATA/controllers.yaml
+
+          export PROXY=http://squid.internal:3128
+          export NO_PROXY=10.0.0.0/8,192.168.0.0/16,127.0.0.1
+
+          juju add-model $JUJU_MODEL
+          juju model-config http-proxy=$PROXY https-proxy=$PROXY ftp-proxy=$PROXY no-proxy=$NO_PROXY
+
+          git clone $REPOSITORY -b $BRANCH $REPO_DIR
+          cd $REPO_DIR
+
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install tox
+
+          # workaround unneeded missing dependency charmcraft
+          ln -s /usr/bin/false charmcraft
+          export PATH=$PATH:$PWD
+
+          export MK8S_CHARM=$CHARM_NAME
+          export MK8S_CHARM_CHANNEL=$CHARM_CHANNEL
+          export MK8S_CLUSTER_SIZE=$CLUSTER_SIZE
+          export MK8S_PROXY=$PROXY
+          export MK8S_NO_PROXY=$NO_PROXY
+          export MK8S_CONSTRAINTS='mem=2G cores=2 root-disk=20G'
+          export MK8S_SNAP_CHANNELS=$SNAP_CHANNELS
+
+          args="--model $JUJU_MODEL"
+          if [[ $PARALLEL == 'true' ]]; then
+            args="$args -n 3"
+          fi
+
+          tox -e integration -- $args
