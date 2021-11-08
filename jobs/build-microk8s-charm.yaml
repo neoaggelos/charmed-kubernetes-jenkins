@@ -113,13 +113,79 @@
             echo Release revision $revision of charm $charm to edge
             sudo lxc shell $container -- bash -c "charmcraft release $charm --revision $revision --channel edge"
           fi
+
+- job:
+    name: 'release-microk8s-charm'
+    description: |
+      Release a MicroK8s charm revision to a CharmHub channel
+    project-type: freestyle
+    node: runner-amd64
+    wrappers:
+      - ansicolor
+      - timestamps
+      - workspace-cleanup
+    parameters:
+      - string:
+          name: CHARM_NAME
+          default: "microk8s"
+          description: |
+            Source repository for MicroK8s charm.
+      - string:
+          name: REVISION
+          default: "-1"
+          description: |
+            Charm revision. If set to -1, will use latest revision from CharmHub.
+      - string:
+          name: CHANNEL
+          default: "edge"
+          description: |
+            Channel to publish.
+    properties:
+      - build-discarder:
+          num-to-keep: 3
+      - build-blocker:
+          use-build-blocker: true
+          blocking-jobs:
+            - "infra.*"
+          block-level: 'NODE'
+
+    builders:
+      - shell: |
+          #!/bin/bash
+          set -eux
+          set -o allexport
+          [[ -f $WORKSPACE/.env ]] && source $WORKSPACE/.env
+          set +o allexport
+
+          container="${JOB_NAME}-${BUILD_NUMBER}"
+          function cleanup() {
+            set +e
+            sudo lxc shell $container -- bash -c 'charmcraft logout'
+            sudo lxc delete $container --force
+            set -e
           }
 
-          run 'sudo snap install lxd'
-          run 'sudo lxd init --auto'
-          run 'sudo usermod -a -G lxd ubuntu'
-          run 'sudo snap install charmcraft --classic'
-          run 'mkdir -p snap/charmcraft/common/config'
+          trap cleanup EXIT
+
+          sudo lxc launch ubuntu:20.04 $container
+          timeout 5m bash -c "
+            until sudo lxc shell $container -- bash -c 'snap install charmcraft --classic'; do
+              sleep 3
+            done
+          "
+
+          sudo lxc shell $container -- bash -c 'charmcraft login'
+          sudo lxc shell $container -- bash -c 'charmcraft whoami'
+          case $REVISION in
+            -1)
+              revision=$(sudo lxc shell $container -- bash -c "charmcraft revisions $CHARM_NAME 2>&1 | grep "^[0-9]" | head -1 | cut -f1 -d' '")
+              ;;
+            *)
+              revision=$REVISION
+              ;;
+          esac
+
+          sudo lxc shell $container -- bash -c "charmcraft release $CHARM_NAME --revision $revision --channel $CHANNEL"
 
           # TODO: update when charmcraft supports non-interactive logins
           # juju scp $CHARMCRAFT_CREDENTIALS ubuntu/leader:snap/charmcraft/common/config/charmcraft.credentials
