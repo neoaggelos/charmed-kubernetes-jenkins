@@ -3,7 +3,7 @@
 - job:
     name: 'build-microk8s-charm'
     description: |
-      Build MicroK8s charm and upload revision to CharmHub.
+      Build MicroK8s charm, upload revision to CharmHub and release to edge.
     project-type: freestyle
     node: runner-amd64
     wrappers:
@@ -28,6 +28,11 @@
           default: "master"
           description: |
             Branch from which to build the MicroK8s charm.
+      - bool:
+          name: RELEASE_TO_EDGE
+          default: "false"
+          description: |
+            Release charm to edge channel.
     properties:
       - build-discarder:
           num-to-keep: 3
@@ -49,14 +54,30 @@
           [[ -f $WORKSPACE/.env ]] && source $WORKSPACE/.env
           set +o allexport
 
+          container="${JOB_NAME}-${BUILD_NUMBER}"
           function cleanup() {
             set +e
-            run 'charmcraft logout'
+            sudo lxc shell $container -- bash -c 'charmcraft logout'
+            sudo lxc delete $container --force
             juju destroy-model $JUJU_MODEL -y --timeout 1m --force
             rm -rf $JUJU_DATA
             set -e
           }
           trap cleanup EXIT
+
+          sudo lxc launch ubuntu:20.04 $container
+          timeout 5m bash -c "
+            until sudo lxc shell $container -- bash -c 'snap install charmcraft --classic'; do
+              sleep 3
+            done
+          "
+
+          # TODO: update when charmcraft supports non-interactive logins
+          # sudo lxc file push $CHARMCRAFT_CREDENTIALS $container/charmcraft.credentials
+          # sudo lxc shell $container -- bash -c 'mkdir -p ~/snap/charmcraft/common/config/charmcraft.credentials'
+          # sudo lxc shell $container -- bash -c 'cp charmcraft.credentials ~/snap/charmcraft/common/config/charmcraft.credentials'
+          sudo lxc shell $container -- bash -c 'charmcraft login'
+          sudo lxc shell $container -- bash -c 'charmcraft whoami'
 
           export JUJU_DATA=$PWD/data
           export JUJU_MODEL=build-microk8s-charm-${BUILD_NUMBER}
@@ -72,8 +93,26 @@
           juju deploy ubuntu --constraints 'cores=8 mem=4G root-disk=20G allocate-public-ip=true'
           juju-wait -e $JUJU_MODEL -w
 
-          function run() {
-            juju ssh ubuntu/leader -- $@
+          juju ssh ubuntu/leader -- 'sudo snap install lxd'
+          juju ssh ubuntu/leader -- 'sudo lxd init --auto'
+          juju ssh ubuntu/leader -- 'sudo usermod -a -G lxd ubuntu'
+          juju ssh ubuntu/leader -- 'sudo snap install charmcraft --classic'
+
+          juju ssh ubuntu/leader -- "git clone ${REPOSITORY} -b ${BRANCH} charm"
+          juju ssh ubuntu/leader -- 'cd charm && charmcraft build -v'
+
+          juju scp 'ubuntu/leader:charm/*.charm' ./microk8s.charm
+
+          sudo lxc file push ./microk8s.charm $container/microk8s.charm
+          sudo lxc shell $container -- bash -c 'charmcraft upload /microk8s.charm'
+
+          charm=$(unzip -p ./microk8s.charm metadata.yaml | grep "name:" | cut -f2 -d:)
+          revision=$(sudo lxc shell $container -- bash -c "charmcraft revisions $charm 2>&1 | grep "^[0-9]" | head -1 | cut -f1 -d' '")
+
+          if [[ $RELEASE_TO_EDGE == 'true' ]]; then
+            echo Release revision $revision of charm $charm to edge
+            sudo lxc shell $container -- bash -c "charmcraft release $charm --revision $revision --channel edge"
+          fi
           }
 
           run 'sudo snap install lxd'
