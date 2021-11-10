@@ -46,16 +46,6 @@
       - archive:
           artifacts: '*.charm'
 
-    scm:
-      - git:
-          url: https://github.com/charmed-kubernetes/jenkins.git
-          branches:
-            - 'master'
-        skip-tag: true
-        fastpoll: true
-        shallow-clone: true
-        clean: {before: true}
-
     builders:
       - shell: |
           #!/bin/bash
@@ -64,85 +54,14 @@
           [[ -f $WORKSPACE/.env ]] && source $WORKSPACE/.env
           set +o allexport
 
-          bash -eux jobs/microk8s/charms/build.sh
+          git clone https://github.com/charmed-kubernetes/jenkins.git -b master jenkins
+          bash -eux jenkins/jobs/microk8s/charms/build.sh
+
 
 - job:
     name: 'release-microk8s-charm'
     description: |
-      Release a MicroK8s charm revision to a CharmHub channel
-    project-type: freestyle
-    node: runner-amd64
-    wrappers:
-      - ansicolor
-      - timestamps
-      - workspace-cleanup
-    parameters:
-      - string:
-          name: CHARM_NAME
-          default: "microk8s"
-          description: |
-            Source repository for MicroK8s charm.
-      - string:
-          name: REVISION
-          default: "-1"
-          description: |
-            Charm revision. If set to -1, will use latest revision from CharmHub.
-      - string:
-          name: CHANNEL
-          default: "edge"
-          description: |
-            Channel to publish.
-    properties:
-      - build-discarder:
-          num-to-keep: 3
-      - build-blocker:
-          use-build-blocker: true
-          blocking-jobs:
-            - "infra.*"
-          block-level: 'NODE'
-
-    builders:
-      - shell: |
-          #!/bin/bash
-          set -eux
-          set -o allexport
-          [[ -f $WORKSPACE/.env ]] && source $WORKSPACE/.env
-          set +o allexport
-
-          container="${JOB_NAME}-${BUILD_NUMBER}"
-          function cleanup() {
-            set +e
-            sudo lxc shell $container -- bash -c 'charmcraft logout'
-            sudo lxc delete $container --force
-            set -e
-          }
-
-          trap cleanup EXIT
-
-          sudo lxc launch ubuntu:20.04 $container
-          timeout 5m bash -c "
-            until sudo lxc shell $container -- bash -c 'snap install charmcraft --classic'; do
-              sleep 3
-            done
-          "
-
-          sudo lxc shell $container -- bash -c 'charmcraft login'
-          sudo lxc shell $container -- bash -c 'charmcraft whoami'
-          case $REVISION in
-            -1)
-              revision=$(sudo lxc shell $container -- bash -c "charmcraft revisions $CHARM_NAME 2>&1 | grep "^[0-9]" | head -1 | cut -f1 -d' '")
-              ;;
-            *)
-              revision=$REVISION
-              ;;
-          esac
-
-          sudo lxc shell $container -- bash -c "charmcraft release $CHARM_NAME --revision $revision --channel $CHANNEL"
-
-- job:
-    name: 'test-microk8s-charm'
-    description: |
-      Test a MicroK8s charm
+      Run integration tests on the MicroK8s charm and release to stable.
     project-type: freestyle
     node: runner-amd64
     wrappers:
@@ -152,10 +71,10 @@
       - credentials-binding:
           - file:
               credential-id: JUJUCONTROLLERS_SERVERSTACK
-              variable: JUJUCONTROLLERS_SERVERSTACK
+              variable: JUJUCONTROLLERS
           - file:
               credential-id: JUJUACCOUNTS_SERVERSTACK
-              variable: JUJUACCOUNTS_SERVERSTACK
+              variable: JUJUACCOUNTS
     parameters:
       - string:
           name: REPOSITORY
@@ -171,12 +90,17 @@
           name: CHARM_NAME
           default: "microk8s"
           description: |
-            MicroK8s charm name to install.
+            MicroK8s charm to release.
       - string:
-          name: CHARM_CHANNEL
-          default: "edge"
+          name: FROM_CHANNEL
+          default: "latest/edge"
           description: |
-            Charm channel.
+            Integration tests will be run against this channel. Must be in `track/risk` or `track/risk/branch` format.
+      - string:
+          name: TO_CHANNEL
+          default: "latest/stable"
+          description: |
+            After tests pass, charm will be pushed to this channel. Must be in `track/risk` or `track/risk/branch` format.
       - string:
           name: CLUSTER_SIZE
           default: "3"
@@ -188,10 +112,15 @@
           description: |
             MicroK8s snap channels to test (space or comma separated).
       - bool:
-          name: PARALLEL
+          name: SKIP_TESTS
           default: "false"
           description: |
-            Run tests in parallel.
+            Skip tests before running release (NOT RECOMMENDED).
+      - bool:
+          name: SKIP_RELEASE
+          default: "false"
+          description: |
+            Skip releasing to TO_CHANNEL after tests succeed.
     properties:
       - build-discarder:
           num-to-keep: 3
@@ -209,50 +138,5 @@
           [[ -f $WORKSPACE/.env ]] && source $WORKSPACE/.env
           set +o allexport
 
-          function cleanup() {
-            set +e
-            juju destroy-model $JUJU_MODEL -y --timeout 1m --force
-            rm -rf $JUJU_DATA
-            rm -rf $REPO_DIR
-            set -e
-          }
-          trap cleanup EXIT
-
-          export REPO_DIR=microk8s-${BUILD_NUMBER}
-          export JUJU_DATA=$PWD/data
-          export JUJU_MODEL=test-microk8s-charm-${BUILD_NUMBER}
-          mkdir -p $JUJU_DATA
-          cp $JUJUACCOUNTS_SERVERSTACK $JUJU_DATA/accounts.yaml
-          cp $JUJUCONTROLLERS_SERVERSTACK $JUJU_DATA/controllers.yaml
-
-          export PROXY=http://squid.internal:3128
-          export NO_PROXY=10.0.0.0/8,192.168.0.0/16,127.0.0.1
-
-          juju add-model $JUJU_MODEL
-          juju model-config http-proxy=$PROXY https-proxy=$PROXY ftp-proxy=$PROXY no-proxy=$NO_PROXY
-
-          git clone $REPOSITORY -b $BRANCH $REPO_DIR
-          cd $REPO_DIR
-
-          python3 -m venv venv
-          . venv/bin/activate
-          pip install tox
-
-          # workaround unneeded missing dependency charmcraft
-          ln -s /usr/bin/false charmcraft
-          export PATH=$PATH:$PWD
-
-          export MK8S_CHARM=$CHARM_NAME
-          export MK8S_CHARM_CHANNEL=$CHARM_CHANNEL
-          export MK8S_CLUSTER_SIZE=$CLUSTER_SIZE
-          export MK8S_PROXY=$PROXY
-          export MK8S_NO_PROXY=$NO_PROXY
-          export MK8S_CONSTRAINTS='mem=2G cores=2 root-disk=20G'
-          export MK8S_SNAP_CHANNELS=$SNAP_CHANNELS
-
-          args="--model $JUJU_MODEL"
-          if [[ $PARALLEL == 'true' ]]; then
-            args="$args -n 3"
-          fi
-
-          tox -e integration -- $args
+          git clone https://github.com/charmed-kubernetes/jenkins.git -b master jenkins
+          bash -eux jenkins/jobs/microk8s/charms/release.sh
